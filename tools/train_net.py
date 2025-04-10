@@ -72,6 +72,7 @@ class Trainer(DefaultTrainer):
         return ret
     
     def resume_or_load(self, resume=True):
+    	#import pdb; pdb.set_trace()  # Breakpoint here
         checkpoint = self.checkpointer.resume_or_load(self.cfg.MODEL.WEIGHTS, resume=resume)
         if resume and self.checkpointer.has_checkpoint():
             self.start_iter = checkpoint.get("iteration", -1) + 1
@@ -177,6 +178,7 @@ class Trainer(DefaultTrainer):
 
     @classmethod
     def test_with_TTA(cls, cfg, model):
+        import pdb; pdb.set_trace()  # Breakpoint here
         logger = logging.getLogger("adet.trainer")
         # In the end of training, run an evaluation with TTA
         # Only support some R-CNN models.
@@ -274,6 +276,7 @@ def main(args):
     cfg = setup(args)
 
     if args.eval_only:
+        import pdb; pdb.set_trace()
         model = Trainer.build_model(cfg)
         AdetCheckpointer(model, save_dir=cfg.OUTPUT_DIR).resume_or_load(
             cfg.MODEL.WEIGHTS, resume=args.resume

@@ -8,9 +8,10 @@ from detectron2.modeling import build_backbone
 from detectron2.structures import ImageList, Instances
 from adet.layers.pos_encoding import PositionalEncoding2D
 from adet.modeling.model.losses import SetCriterion
-from adet.modeling.model.matcher import build_matcher
+#from adet.modeling.model.matcher import build_matcher
 from adet.modeling.model.detection_transformer import DETECTION_TRANSFORMER
 from adet.utils.misc import NestedTensor
+from adet.modeling.model.losses import SetCriterion
 
 
 class Joiner(nn.Sequential):
@@ -128,7 +129,7 @@ class TransformerPureDetector(nn.Module):
         )
         backbone.num_channels = d2_backbone.num_channels
         self.detection_transformer = DETECTION_TRANSFORMER(cfg, backbone)
-        bezier_matcher, point_matcher = build_matcher(cfg)
+        #bezier_matcher, point_matcher = build_matcher(cfg)
 
         loss_cfg = cfg.MODEL.TRANSFORMER.LOSS
         weight_dict = {
@@ -164,8 +165,10 @@ class TransformerPureDetector(nn.Module):
 
         self.criterion = SetCriterion(
             self.detection_transformer.num_classes,
-            bezier_matcher,
-            point_matcher,
+            cfg, # Pass the whole config
+            self.num_classes,
+            #bezier_matcher,
+            #point_matcher,
             weight_dict,
             enc_losses,
             cfg.MODEL.TRANSFORMER.LOSS.BEZIER_SAMPLE_POINTS,
