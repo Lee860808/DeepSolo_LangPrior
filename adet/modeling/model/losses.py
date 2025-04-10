@@ -5,7 +5,11 @@ import copy
 from adet.utils.misc import accuracy, is_dist_avail_and_initialized
 from detectron2.utils.comm import get_world_size
 from adet.utils.curve_utils import BezierSampler
-
+from .matcher import build_matcher as build_matcher_orig # Keep original for bezier
+from .matcher_langprior import build_matcher as build_matcher_langprior # Your modified matcher file/func name
+from .linguistic_prior_utils import load_char_embeddings, generate_centroids, get_corpus
+from .linguistic_prior_utils import get_char_embeddings_canine, generate_centroids, get_corpus # Import specific functions
+import pickle # For loading custom dict
 
 def sigmoid_focal_loss(inputs, targets, num_inst, alpha: float = 0.25, gamma: float = 2):
     """
@@ -50,14 +54,15 @@ class SetCriterion(nn.Module):
 
     def __init__(
             self,
+            cfg, # Pass the whole config object
             num_classes,
-            enc_matcher,
-            dec_matcher,
+            # enc_matcher, # Will build inside
+            # dec_matcher, # Will build inside
             weight_dict,
             enc_losses,
             num_sample_points,
             dec_losses,
-            voc_size,
+            voc_size, # Keep for CTC loss
             num_ctrl_points,
             focal_alpha=0.25,
             focal_gamma=2.0
@@ -71,18 +76,75 @@ class SetCriterion(nn.Module):
             focal_alpha: alpha in Focal Loss
         """
         super().__init__()
+        self.cfg = cfg # Store config
         self.num_classes = num_classes
-        self.enc_matcher = enc_matcher
-        self.dec_matcher = dec_matcher
+        #self.enc_matcher = enc_matcher
+        #self.dec_matcher = dec_matcher
         self.weight_dict = weight_dict
         self.enc_losses = enc_losses
         self.num_sample_points = num_sample_points
         self.bezier_sampler = BezierSampler(num_sample_points=num_sample_points)
         self.dec_losses = dec_losses
         self.voc_size = voc_size
+        self.char_voc_size = voc_size - 1 # Actual number of character classes
         self.focal_alpha = focal_alpha
         self.focal_gamma = focal_gamma
         self.num_ctrl_points = num_ctrl_points
+        self.text_match_weight = cfg.MODEL.TRANSFORMER.LOSS.POINT_TEXT_WEIGHT
+        self.centroids = None
+        self.vocab = None
+        if self.text_match_weight > 0:
+            print("Initializing Linguistic Priors for Matcher...")
+            # Define vocab (ensure it matches your model's output layer size - 1)
+            device = torch.device(cfg.MODEL.DEVICE)
+            if self.voc_size == 37:
+                self.vocab = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9']
+            elif self.voc_size == 96:
+                 self.vocab = [' ','!','"','#','$','%','&','\'','(',')','*','+',',','-','.','/','0','1','2','3','4','5','6','7','8','9',':',';','<','=','>','?','@','A','B','C','D','E','F','G','H','I','J','K','L','M','N','O','P','Q','R','S','T','U','V','W','X','Y','Z','[','\\',']','^','_','`','a','b','c','d','e','f','g','h','i','j','k','l','m','n','o','p','q','r','s','t','u','v','w','x','y','z','{','|','}','~']
+            elif cfg.MODEL.TRANSFORMER.CUSTOM_DICT:
+                 # TODO: Load vocab from CUSTOM_DICT file correctly
+                 import pickle
+                 try:
+                     with open(cfg.MODEL.TRANSFORMER.CUSTOM_DICT, 'rb') as fp:
+                         custom_vocab_list = pickle.load(fp)
+                     # Convert integer char codes back to characters if needed
+                     self.vocab = [chr(c) for c in custom_vocab_list] # Example conversion
+                     print(f"Loaded custom vocab of size {len(self.vocab)} from {cfg.MODEL.TRANSFORMER.CUSTOM_DICT}")
+                 except Exception as e:
+                     print(f"ERROR loading custom dict: {e}")
+                     raise ValueError("Failed to load custom vocabulary")
+            else:
+                raise ValueError("Vocabulary size not supported or CUSTOM_DICT not provided.")
+
+            assert len(self.vocab) == self.voc_size, f"Loaded vocab size {len(self.vocab)} != config voc_size {self.voc_size}"
+
+            # TODO: Define embedding dimension based on your chosen model (e.g., CANINE base is often 768)
+            canine_model_name = "google/canine-c"
+            embed_dim = 768 # Placeholder dimension
+            embeddings_dict, _ = load_char_embeddings(self.vocab, embed_dim) # Load embeddings
+            char_embeddings_dict = get_char_embeddings_canine(self.vocab, model_name=canine_model_name, device=device)
+            
+            # Load corpus
+            # TODO: You might want to define the corpus source in config
+            generic_dict_path = "datasets/generic_90k_words.txt"
+            corpus = get_corpus(cfg.DATASETS.TRAIN, generic_dict_path)
+
+            # Generate centroids - needs to run only once, ideally load precomputed
+            # We do it here for simplicity, but moving outside Trainer init is better
+            device = torch.device(cfg.MODEL.DEVICE)
+            self.centroids = generate_centroids(embeddings_dict, corpus, self.vocab, device)
+            global _canine_model_cache
+            if canine_model_name in _canine_model_cache:
+                 del _canine_model_cache[canine_model_name] # Remove model from cache
+                 torch.cuda.empty_cache() # Try to clear GPU memory
+            self.enc_matcher, self.dec_matcher = build_matcher_langprior(
+            cfg,
+            centroids=self.centroids,
+            vocab=self.vocab
+        )
+
+    def get_char_voc_size(self):
+        return self.voc_size - 1
 
     def loss_labels(self, outputs, targets, indices, num_inst, log=False):
         """Classification loss (NLL)
