@@ -29,6 +29,11 @@ _C.MODEL.TOP_MODULE = CN()
 _C.MODEL.TOP_MODULE.NAME = "conv"
 _C.MODEL.TOP_MODULE.DIM = 16
 
+_C.MODEL.LINGUISTIC_PRIOR = CN()
+_C.MODEL.LINGUISTIC_PRIOR.EMBED_MODEL_NAME = "google/canine-c"
+_C.MODEL.LINGUISTIC_PRIOR.GENERIC_DICT_PATH = "datasets/generic_90k_words.txt"
+_C.MODEL.LINGUISTIC_PRIOR.SOFT_TARGET_THRESHOLD = 0.85
+_C.MODEL.LINGUISTIC_PRIOR.TEMPERATURE = 1.0
 
 # ---------------------------------------------------------------------------- #
 # BAText Options

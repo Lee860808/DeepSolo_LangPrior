@@ -1,0 +1,83 @@
+# Example: configs/R_50/Base_det_LangPrior.yaml (Complete)
+MODEL:
+  META_ARCHITECTURE: "TransformerPureDetector"
+  MASK_ON: False
+  PIXEL_MEAN: [123.675, 116.280, 103.530]
+  PIXEL_STD: [58.395, 57.120, 57.375]
+  BACKBONE:
+    NAME: "build_resnet_backbone"
+  RESNETS:
+    DEPTH: 50
+    STRIDE_IN_1X1: False
+    OUT_FEATURES: ["res3", "res4", "res5"]
+  TRANSFORMER:
+    ENABLED: True
+    NUM_FEATURE_LEVELS: 4
+    TEMPERATURE: 10000 # For positional encoding generation in decoder
+    ENC_LAYERS: 6
+    DEC_LAYERS: 6
+    DIM_FEEDFORWARD: 1024
+    HIDDEN_DIM: 256
+    DROPOUT: 0.0
+    NHEADS: 8
+    NUM_QUERIES: 100
+    ENC_N_POINTS: 4
+    DEC_N_POINTS: 4
+    NUM_POINTS: 25 # Number of points per query/instance
+    INFERENCE_TH_TEST: 0.4
+    # --- Vocabulary Settings (Usually overridden in final config) --- #
+    # 37 = English alphanumeric (lowercase); 96 = Extended ASCII-like; Other = Requires CUSTOM_DICT
+    VOC_SIZE: 37 # Typically overridden per dataset
+    CUSTOM_DICT: "" # Path to custom vocab pickle file if VOC_SIZE is not 37 or 96
+    # --- Loss Configuration --- #
+    LOSS:
+      AUX_LOSS: True # Enable auxiliary losses from intermediate decoder layers
+      FOCAL_ALPHA: 0.25 # Alpha for focal loss
+      FOCAL_GAMMA: 2.0  # Gamma for focal loss
+      # Encoder (Bezier Proposal) Losses
+      BEZIER_SAMPLE_POINTS: 25 # Number of points to sample on Bezier curve for loss/matching
+      BEZIER_CLASS_WEIGHT: 1.0 # Weight for proposal classification loss
+      BEZIER_COORD_WEIGHT: 1.0 # Weight for proposal coordinate (sampled points) loss
+      # Decoder (Final Control Point) Losses
+      POINT_CLASS_WEIGHT: 1.0 # Weight for final instance classification loss
+      POINT_COORD_WEIGHT: 1.0 # Weight for final control point coordinate loss
+      POINT_TEXT_WEIGHT: 1.0   # Weight for CTC loss & linguistic matcher cost (Set > 0 to enable linguistic)
+      BOUNDARY_WEIGHT: 0.5   # Weight for boundary point loss
+
+  # --- Linguistic Prior Configuration (NEW) --- #
+  # These settings are used if MODEL.TRANSFORMER.LOSS.POINT_TEXT_WEIGHT > 0
+  LINGUISTIC_PRIOR:
+      EMBED_MODEL_NAME: "google/canine-c" # HuggingFace model for char embeddings
+      GENERIC_DICT_PATH: "datasets/generic_90k_words.txt" # Path to word list for centroids
+      SOFT_TARGET_THRESHOLD: 0.85 # Threshold T for soft target generation
+      TEMPERATURE: 1.0           # Temperature for softmax when generating soft target
+
+SOLVER:
+  WEIGHT_DECAY: 1e-4
+  OPTIMIZER: "ADAMW"
+  LR_BACKBONE_NAMES: ['backbone.0'] # Used to set different LR for backbone
+  LR_LINEAR_PROJ_NAMES: ['reference_points', 'sampling_offsets'] # Used to set different LR
+  LR_LINEAR_PROJ_MULT: 1.0 # Multiplier for LR of linear proj names
+  CLIP_GRADIENTS:
+    ENABLED: True
+    CLIP_TYPE: "full_model" # Clip gradients for the whole model
+    CLIP_VALUE: 0.1
+    NORM_TYPE: 2.0 # L2 norm
+
+INPUT:
+  HFLIP_TRAIN: False # Horizontal flip augmentation
+  MIN_SIZE_TRAIN: (480, 512, 544, 576, 608, 640, 672, 704, 736, 768, 800, 832, 864, 896) # Range for ResizeShortestEdge
+  MAX_SIZE_TRAIN: 1600
+  MIN_SIZE_TEST: 1000
+  MAX_SIZE_TEST: 1892
+  CROP:
+    ENABLED: True # Enable instance-aware cropping during training
+    CROP_INSTANCE: False # If False, ensures instances aren't cut by crop box
+    SIZE: [0.1, 0.1] # Relative crop size range
+  FORMAT: "RGB" # Input image format
+
+DATALOADER:
+  NUM_WORKERS: 8 # Number of threads for data loading
+
+VERSION: 2
+SEED: 42 # Random seed

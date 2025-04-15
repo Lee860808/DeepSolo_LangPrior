@@ -5,6 +5,10 @@ setup.py
 /home/kylee/DeepSolo/adet/layers/csrc/vision.cpp
 /home/kylee/DeepSolo/adet/layers/csrc/DeformAttn/ms_deform_attn_cpu.cpp
 /home/kylee/DeepSolo/adet/layers/csrc/DeformAttn/ms_deform_attn_cuda.cu
+/home/kylee/DeepSolo_LangPriors/adet/layers/csrc/cuda_version.cu
+/home/kylee/DeepSolo_LangPriors/adet/layers/csrc/vision.cpp
+/home/kylee/DeepSolo_LangPriors/adet/layers/csrc/DeformAttn/ms_deform_attn_cpu.cpp
+/home/kylee/DeepSolo_LangPriors/adet/layers/csrc/DeformAttn/ms_deform_attn_cuda.cu
 AdelaiDet.egg-info/PKG-INFO
 AdelaiDet.egg-info/SOURCES.txt
 AdelaiDet.egg-info/dependency_links.txt
@@ -35,6 +39,7 @@ adet/modeling/__init__.py
 adet/modeling/text_spotter.py
 adet/modeling/model/__init__.py
 adet/modeling/model/detection_transformer.py
+adet/modeling/model/linguistic_prior_utils.py
 adet/modeling/model/losses.py
 adet/modeling/model/matcher.py
 adet/modeling/model/utils.py

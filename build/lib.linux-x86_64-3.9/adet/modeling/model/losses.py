@@ -1,11 +1,140 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
+import warnings
+import json
+import os
+from tqdm import tqdm
+from transformers import CanineTokenizer, CanineModel
+from detectron2.data import MetadataCatalog
 import copy
 from adet.utils.misc import accuracy, is_dist_avail_and_initialized
 from detectron2.utils.comm import get_world_size
 from adet.utils.curve_utils import BezierSampler
+from .matcher import build_matcher # Keep original for bezier
+#from .matcher_langprior import build_matcher as build_matcher_langprior # Your modified matcher file/func name
+#from .linguistic_prior_utils import load_char_embeddings, generate_centroids, get_corpus
+from .linguistic_prior_utils import get_char_embeddings_canine, generate_centroids, get_corpus # Import specific functions
+import pickle # For loading custom dict
 
+_canine_model_cache = {}
+_canine_tokenizer_cache = {}
+
+# Pass cfg to get model name
+def get_canine_model(cfg, device='cpu'):
+    """Loads CANINE model and tokenizer, using a cache."""
+    global _canine_model_cache, _canine_tokenizer_cache
+    model_name = cfg.MODEL.LINGUISTIC_PRIOR.EMBED_MODEL_NAME # Read from cfg
+    if model_name not in _canine_model_cache:
+        print(f"Loading CANINE model: {model_name}...")
+        model = CanineModel.from_pretrained(model_name).to(device)
+        model.eval() # Set to evaluation mode
+        _canine_model_cache[model_name] = model
+        print(f"Loading CANINE tokenizer: {model_name}...")
+        tokenizer = CanineTokenizer.from_pretrained(model_name)
+        _canine_tokenizer_cache[model_name] = tokenizer
+    return _canine_model_cache[model_name], _canine_tokenizer_cache[model_name]
+
+def get_char_embeddings_canine(cfg, characters, device='cpu'):
+    """
+    Computes embeddings for a list of characters using CANINE.
+    Args:
+        cfg (CfgNode): Configuration object.
+        characters (list): List of unique characters.
+        device: Torch device.
+    Returns:
+        dict: Mapping character -> embedding tensor.
+    """
+    model_name = cfg.MODEL.LINGUISTIC_PRIOR.EMBED_MODEL_NAME
+    model, tokenizer = get_canine_model(cfg, device) # Pass cfg
+    embeddings_dict = {}
+    print(f"Generating character embeddings using {model_name}...")
+
+    for char in tqdm(characters):
+        inputs = tokenizer(char, return_tensors="pt", padding=True, truncation=True).to(device)
+        outputs = model(**inputs)
+        token_ids = inputs['input_ids'][0].tolist()
+        first_char_token_idx = -1
+        for idx, token_id in enumerate(token_ids):
+             if token_id not in tokenizer.all_special_ids:
+                 first_char_token_idx = idx
+                 break
+
+        if first_char_token_idx != -1:
+            char_embedding = outputs.last_hidden_state[0, first_char_token_idx, :].detach().cpu()
+            embeddings_dict[char] = char_embedding
+        else:
+            warnings.warn(f"Could not find valid character token for '{char}' in CANINE output. Skipping.")
+            embeddings_dict[char] = None
+
+    print("Character embedding generation complete.")
+    return embeddings_dict
+
+# Pass cfg to get dictionary path
+def get_corpus(cfg, dataset_names):
+    """
+    Loads words from training datasets annotations and an optional generic dictionary.
+    Args:
+        cfg (CfgNode): Configuration object.
+        dataset_names (tuple): Names of training datasets registered in Detectron2.
+    Returns:
+        list: A list of unique words making up the corpus (converted to uppercase).
+    """
+    print("Building corpus...")
+    corpus_words = set()
+    generic_dict_path = cfg.MODEL.LINGUISTIC_PRIOR.GENERIC_DICT_PATH # Read from cfg
+
+    # 1. Load from dataset annotations (Logic remains the same)
+    for dataset_name in dataset_names:
+        try:
+            metadata = MetadataCatalog.get(dataset_name)
+            json_file = metadata.json_file
+            print(f"  Loading annotations from: {json_file}")
+            with open(json_file, 'r', encoding='utf-8') as f: # Added encoding
+                data = json.load(f)
+                if 'annotations' in data:
+                    for ann in data['annotations']:
+                        text = None
+                        if 'rec' in ann and isinstance(ann['rec'], str):
+                            text = ann['rec']
+                        elif 'text' in ann and isinstance(ann['text'], str): # Common key in some formats
+                             text = ann['text']
+                        elif 'utf8_string' in ann and isinstance(ann['utf8_string'], str): # Another common key
+                             text = ann['utf8_string']
+                        # Add other potential keys if datasets use different names for transcription
+
+                        if text:
+                             word = text.strip()
+                             # Basic filtering (optional): remove very short/long or non-alphanumeric heavy words
+                             if word and len(word) > 1 and len(word) < 30: # Example filter
+                                 corpus_words.add(word.upper())
+
+                else:
+                     print(f"    Warning: No 'annotations' key found in {json_file}")
+        except FileNotFoundError:
+             print(f"  Warning: Annotation file not found: {json_file}. Skipping.")
+        except Exception as e:
+            print(f"  Warning: Could not load or parse annotations for {dataset_name}. Error: {e}")
+
+
+    # 2. Load from generic dictionary (Logic remains the same)
+    if generic_dict_path and os.path.exists(generic_dict_path):
+        print(f"  Loading generic dictionary from: {generic_dict_path}")
+        try:
+            with open(generic_dict_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    word = line.strip()
+                    if word:
+                        corpus_words.add(word.upper())
+        except Exception as e:
+            print(f"  Warning: Could not load generic dictionary. Error: {e}")
+    else:
+        print(f"  Warning: Generic dictionary path not found or not specified: {generic_dict_path}")
+
+    corpus_list = sorted(list(corpus_words))
+    print(f"Corpus built with {len(corpus_list)} unique words.")
+    return corpus_list
 
 def sigmoid_focal_loss(inputs, targets, num_inst, alpha: float = 0.25, gamma: float = 2):
     """
@@ -50,14 +179,15 @@ class SetCriterion(nn.Module):
 
     def __init__(
             self,
+            cfg, # Pass the whole config object
             num_classes,
-            enc_matcher,
-            dec_matcher,
+            # enc_matcher, # Will build inside
+            # dec_matcher, # Will build inside
             weight_dict,
             enc_losses,
             num_sample_points,
             dec_losses,
-            voc_size,
+            voc_size, # Keep for CTC loss
             num_ctrl_points,
             focal_alpha=0.25,
             focal_gamma=2.0
@@ -71,18 +201,110 @@ class SetCriterion(nn.Module):
             focal_alpha: alpha in Focal Loss
         """
         super().__init__()
+        self.cfg = cfg # Store config
         self.num_classes = num_classes
-        self.enc_matcher = enc_matcher
-        self.dec_matcher = dec_matcher
+        #self.enc_matcher = enc_matcher
+        #self.dec_matcher = dec_matcher
         self.weight_dict = weight_dict
         self.enc_losses = enc_losses
         self.num_sample_points = num_sample_points
         self.bezier_sampler = BezierSampler(num_sample_points=num_sample_points)
         self.dec_losses = dec_losses
         self.voc_size = voc_size
+        self.char_voc_size = voc_size - 1 # Actual number of character classes
         self.focal_alpha = focal_alpha
         self.focal_gamma = focal_gamma
         self.num_ctrl_points = num_ctrl_points
+        self.text_match_weight = cfg.MODEL.TRANSFORMER.LOSS.POINT_TEXT_WEIGHT
+        self.centroids = None
+        self.vocab = None
+        if self.text_match_weight > 0:
+            print("Initializing Linguistic Priors for Matcher...")
+            # Define vocab (ensure it matches your model's output layer size - 1)
+            device = torch.device(cfg.MODEL.DEVICE)
+            if self.voc_size == 37:
+                self.vocab = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9']
+            elif self.voc_size == 96:
+                 self.vocab = [' ','!','"','#','$','%','&','\'','(',')','*','+',',','-','.','/','0','1','2','3','4','5','6','7','8','9',':',';','<','=','>','?','@','A','B','C','D','E','F','G','H','I','J','K','L','M','N','O','P','Q','R','S','T','U','V','W','X','Y','Z','[','\\',']','^','_','`','a','b','c','d','e','f','g','h','i','j','k','l','m','n','o','p','q','r','s','t','u','v','w','x','y','z','{','|','}','~']
+            elif cfg.MODEL.TRANSFORMER.CUSTOM_DICT:
+                 # TODO: Load vocab from CUSTOM_DICT file correctly
+                 import pickle
+                 try:
+                     with open(cfg.MODEL.TRANSFORMER.CUSTOM_DICT, 'rb') as fp:
+                         custom_vocab_list = pickle.load(fp)
+                     # Convert integer char codes back to characters if needed
+                     self.vocab = [chr(c) for c in custom_vocab_list] # Example conversion
+                     print(f"Loaded custom vocab of size {len(self.vocab)} from {cfg.MODEL.TRANSFORMER.CUSTOM_DICT}")
+                 except Exception as e:
+                     print(f"ERROR loading custom dict: {e}")
+                     raise ValueError("Failed to load custom vocabulary")
+            else:
+                raise ValueError("Vocabulary size not supported or CUSTOM_DICT not provided.")
+
+                  
+            assert len(self.vocab) == self.char_voc_size, f"Loaded vocab size {len(self.vocab)} != expected char_voc_size {self.char_voc_size}"
+            # assert len(self.vocab) == self.voc_size, f"Loaded vocab size {len(self.vocab)} != config voc_size {self.voc_size}"
+
+            # TODO: Define embedding dimension based on your chosen model (e.g., CANINE base is often 768)
+            canine_model_name = "google/canine-c"
+            embed_dim = 768 # Placeholder dimension
+            #embeddings_dict, _ = load_char_embeddings(self.vocab, embed_dim) # Load embeddings
+            #char_embeddings_dict = get_char_embeddings_canine(self.vocab, model_name=canine_model_name, device=device)
+            char_embeddings_dict = get_char_embeddings_canine(cfg, self.vocab, device=device)
+            
+            # Load corpus
+            # TODO: You might want to define the corpus source in config
+            generic_dict_path = "datasets/generic_90k_words.txt"
+            corpus = get_corpus(cfg.DATASETS.TRAIN, generic_dict_path)
+
+            # Generate centroids - needs to run only once, ideally load precomputed
+            # We do it here for simplicity, but moving outside Trainer init is better
+            device = torch.device(cfg.MODEL.DEVICE)
+            self.centroids = generate_centroids(embeddings_dict, corpus, self.vocab, device)
+            global _canine_model_cache
+            if canine_model_name in _canine_model_cache:
+                 del _canine_model_cache[canine_model_name] # Remove model from cache
+                 torch.cuda.empty_cache() # Try to clear GPU memory
+            self.enc_matcher, self.dec_matcher = build_matcher(
+            cfg,
+            centroids=self.centroids,
+            vocab=self.vocab
+        )
+    
+    # Pass cfg to get temperature
+    def generate_soft_distribution(cfg, char_centroid, all_centroids):
+        temperature = cfg.MODEL.LINGUISTIC_PRIOR.TEMPERATURE # Read from cfg
+        if char_centroid is None or torch.isnan(char_centroid).any() or (char_centroid == 0).all():
+            warnings.warn("Character centroid invalid, zero, or missing, returning uniform distribution.")
+            voc_size = all_centroids.shape[0]
+            return torch.ones(voc_size, device=all_centroids.device) / voc_size
+        similarities = F.cosine_similarity(char_centroid, all_centroids, dim=-1)
+        distribution = F.softmax(similarities / temperature, dim=-1)
+        return distribution
+
+    def apply_distribution_threshold(cfg, distribution, target_idx, voc_size=-1):
+        threshold = cfg.MODEL.LINGUISTIC_PRIOR.SOFT_TARGET_THRESHOLD # Read from cfg
+    # ... (Rest of the logic from previous step) ...
+        if voc_size == -1:
+            voc_size = distribution.shape[0]
+        if voc_size <= 1: # Handle edge case
+            return distribution
+        k = voc_size # Size of character vocabulary
+
+        if distribution[target_idx] >= threshold:
+            new_dist = torch.zeros_like(distribution)
+            p1_val = (1.0 - threshold) / (k - 1)
+            new_dist.fill_(p1_val)
+            new_dist[target_idx] = threshold
+            sum_val = new_dist.sum()
+            if abs(sum_val - 1.0) > 1e-6: # Add tolerance for floating point
+                new_dist /= sum_val
+            return new_dist
+        else:
+            return torch.ones_like(distribution) / k
+
+    def get_char_voc_size(self):
+        return self.voc_size - 1
 
     def loss_labels(self, outputs, targets, indices, num_inst, log=False):
         """Classification loss (NLL)

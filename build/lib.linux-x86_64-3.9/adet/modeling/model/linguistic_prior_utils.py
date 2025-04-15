@@ -8,7 +8,6 @@ import os
 import pickle
 from tqdm import tqdm
 from transformers import CanineTokenizer, CanineModel # Import CANINE specific tools
-#from .safe_canine import SafeCanineModel # Import your patched model
 from detectron2.data import MetadataCatalog # To get annotation file paths
 from detectron2.utils.file_io import PathManager # Use D2's file handling
 
@@ -40,7 +39,7 @@ def get_canine_model(cfg, device='cpu'):
 def get_char_embeddings_canine(cfg, characters, device='cpu'):
     """
     Computes embeddings for a list of characters using CANINE.
-    (Revised V10: Minimal loop, Pad input_ids + Full forward)
+    (Revised V5: Pad short inputs before tokenization)
     Args:
         cfg (CfgNode): Configuration object.
         characters (list): List of unique characters.
@@ -48,85 +47,89 @@ def get_char_embeddings_canine(cfg, characters, device='cpu'):
     Returns:
         dict: Mapping character -> embedding tensor (on CPU).
     """
-    print("--- Using V10 Embedding Function (Minimal Loop) ---") # Identify version
     model_name = cfg.MODEL.LINGUISTIC_PRIOR.EMBED_MODEL_NAME
     model, tokenizer = get_canine_model(cfg, device)
+    embedding_layer = model.embeddings # Use embedding layer directly as in V3
 
-    min_seq_len_for_pooling = 4
+    # --- Define Padding Strategy ---
+    # We need the sequence length AFTER tokenization to be >= 4
+    # Tokenizer often adds [CLS] and [SEP] (2 tokens)
+    # So, the character(s) themselves need to contribute >= 2 tokens.
+    # Single common chars usually map to 1 token ID. Let's pad to be safe.
+    min_char_len_for_tokenizer = 3 # Pad single chars to length 3, e.g., "a__"
+    pad_char = "_" # Choose a padding char unlikely to be OOV or special
 
     embeddings_dict = {}
-    print(f"Generating {len(characters)} character embeddings using {model_name}...")
-    failed_chars = []
+    print(f"Generating character embeddings using {model_name} (Pad Input V5)...")
 
-    # --- Simplified Loop ---
-    for char in characters: # Use simple list iteration
+    failed_chars = []
+    for char in tqdm(characters):
         if not char or char.isspace():
             embeddings_dict[char] = None
             failed_chars.append(repr(char))
             continue
 
         try:
-            # 1. Tokenize
-            inputs = tokenizer(char, return_tensors="pt", padding=False, truncation=False).to(device)
+            # --- Pad the input character string ---
+            padded_char_str = char
+            if len(char) < min_char_len_for_tokenizer:
+                 padded_char_str = char.ljust(min_char_len_for_tokenizer, pad_char)
+            # ------------------------------------
+
+            # 1. Tokenize the (potentially padded) string
+            inputs = tokenizer(padded_char_str, return_tensors="pt", padding=False, truncation=False).to(device)
             input_ids = inputs['input_ids']
 
-            if input_ids.shape[1] == 0: continue # Skip if tokenizer fails
+            # Defensive check for empty tokenization
+            if input_ids.shape[1] == 0:
+                 warnings.warn(f"Tokenizer returned empty sequence for padded '{repr(padded_char_str)}' (original '{repr(char)}'). Skipping.")
+                 failed_chars.append(repr(char))
+                 embeddings_dict[char] = None
+                 continue
 
-            # 2. Pad input_ids
-            current_seq_len = input_ids.shape[1]
-            if current_seq_len < min_seq_len_for_pooling:
-                pad_len = min_seq_len_for_pooling - current_seq_len
-                pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
-                input_ids = F.pad(input_ids, (0, pad_len), mode='constant', value=pad_id)
+            # 2. Pass *only input_ids* to the embedding layer's forward method
+            embedding_output = embedding_layer(input_ids=input_ids)
 
-            # 3. Create Attention Mask
-            attention_mask = torch.ones_like(input_ids).to(device)
-            if current_seq_len < min_seq_len_for_pooling:
-                 attention_mask[0, current_seq_len:] = 0
-
-            # 4. Call full model forward pass
-            outputs = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                output_hidden_states=True
-            )
-
-            # 5. Extract embedding layer output
-            embedding_output = outputs.hidden_states[0]
-
-            # 6. Find original character token index
+            # 3. Find the correct index for the *original* character
             token_ids_list = input_ids[0].tolist()
             first_char_token_idx = -1
-            original_token_ids = tokenizer.encode(char, add_special_tokens=False)
-            if original_token_ids:
-                first_original_token_id = original_token_ids[0]
-                for idx, token_id in enumerate(token_ids_list[:current_seq_len]):
-                     if token_id not in tokenizer.all_special_ids:
-                         if token_id == first_original_token_id:
-                             first_char_token_idx = idx
-                             break
-                         elif first_char_token_idx == -1:
-                             first_char_token_idx = idx
+            # Re-tokenize the *original* char to know its expected token ID(s)
+            original_tokens = tokenizer.encode(char, add_special_tokens=False)
+            if not original_tokens:
+                 warnings.warn(f"Original char '{repr(char)}' tokenized to empty list. Skipping.")
+                 failed_chars.append(repr(char))
+                 embeddings_dict[char] = None
+                 continue
+            first_original_token_id = original_tokens[0]
 
-            # 7. Store embedding if found
+            # Find where this token ID appears after the initial special tokens in the padded sequence
+            found_idx = -1
+            for idx, token_id in enumerate(token_ids_list):
+                 if token_id not in tokenizer.all_special_ids:
+                     if token_id == first_original_token_id:
+                          found_idx = idx
+                          break # Found the first instance of the original char's token
+                     # elif found_idx == -1: # Keep track of first non-special if exact match fails? Maybe too complex.
+                     #    found_idx = idx
+
+            first_char_token_idx = found_idx # Use the found index
+
+
             if first_char_token_idx != -1 and first_char_token_idx < embedding_output.shape[1]:
                 final_embedding = embedding_output[0, first_char_token_idx, :].detach().cpu()
                 embeddings_dict[char] = final_embedding
             else:
-                # warnings.warn(f"Could not find/extract embedding for '{repr(char)}'. Skipping.")
+                warnings.warn(f"Could not find valid token index {first_char_token_idx} for original char '{repr(char)}' in padded sequence tokens: {token_ids_list}. Skipping.")
                 failed_chars.append(repr(char))
                 embeddings_dict[char] = None
 
         except Exception as e:
-             warnings.warn(f"Error processing character '{repr(char)}': {e}")
+             warnings.warn(f"Error processing character '{repr(char)}' with CANINE: {e}")
              failed_chars.append(repr(char))
              embeddings_dict[char] = None
-    # --- Loop End ---
 
     if failed_chars:
         warnings.warn(f"Could not generate embeddings for {len(failed_chars)} characters: {failed_chars}")
-
-    print(f"--- INTENDING TO RETURN embeddings_dict (Length: {len(embeddings_dict)}) ---")
     print("Character embedding generation complete.")
     return embeddings_dict
 
@@ -206,61 +209,57 @@ def get_corpus(cfg, dataset_names):
 def generate_centroids(embeddings_dict, corpus, vocab, device):
     """
     Generates centroids by averaging embeddings for characters in the corpus.
-    Handles None values possibly present in embeddings_dict.
+    Args:
+        embeddings_dict (dict): char -> embedding tensor (on CPU).
+        corpus (list): List of uppercase words.
+        vocab (list): List of characters (lowercase).
+        device: Torch device.
+    Returns:
+        torch.Tensor: Centroid matrix (voc_size, embed_dim) on the specified device.
     """
     print("Generating centroids...")
     voc_size = len(vocab)
-    centroids = torch.zeros(voc_size, embed_dim, device=device, dtype=torch.float32)
-    counts = torch.zeros(voc_size, device=device, dtype=torch.float32)
-    char_to_idx = {char: idx for idx, char in enumerate(vocab)}
+    char_to_idx = {char: idx for idx, char in enumerate(vocab)} # lowercase vocab -> index
 
-    # Infer embed_dim robustly, skipping None values
+    # Infer embed_dim robustly
     embed_dim = 0
     valid_embed_found = False
-    if embeddings_dict is None: # Explicit check for None input
-         warnings.warn("Received None for embeddings_dict. Cannot generate centroids.")
-         return torch.zeros(voc_size, 768, device=device) # Default size guess
-
     for emb in embeddings_dict.values():
         if emb is not None:
             embed_dim = emb.shape[0]
             valid_embed_found = True
             break
-
     if not valid_embed_found:
+        # Handle case where NO embeddings were generated
         warnings.warn("No valid character embeddings found in embeddings_dict. Cannot generate centroids.")
-        return torch.zeros(voc_size, embed_dim or 768, device=device) # Use inferred dim or default
+        return torch.zeros(voc_size, 768, device=device) # Return zeros with default CANINE dim
 
-    # Initialize centroids and counts
-    centroids = torch.zeros(voc_size, embed_dim, device=device, dtype=torch.float32)
+    centroids = torch.zeros(voc_size, embed_dim, device=device, dtype=torch.float32) # Use float32
     counts = torch.zeros(voc_size, device=device, dtype=torch.float32)
 
     processed_chars = 0
-    found_chars_set = set()
-    for word in tqdm(corpus):
+    for word in tqdm(corpus): # Corpus is already uppercase
         for char in word:
-            char_lower = char.lower()
+            char_lower = char.lower() # Convert to lowercase for vocab matching
             if char_lower in char_to_idx:
                 idx = char_to_idx[char_lower]
-                # ---- Check if embedding exists and is not None ----
                 if char_lower in embeddings_dict and embeddings_dict[char_lower] is not None:
                     centroids[idx] += embeddings_dict[char_lower].to(device, dtype=torch.float32)
                     counts[idx] += 1.0
                     processed_chars += 1
-                    found_chars_set.add(char_lower)
-                # ---------------------------------------------------
 
     print(f"Processed {processed_chars} character instances from corpus.")
 
-    # Average embeddings
+    # Average embeddings, handle division by zero
     valid_counts_mask = counts > 0
-    centroids[valid_counts_mask] /= counts[valid_counts_mask].unsqueeze(-1).clamp(min=1.0) # Clamp counts too
+    centroids[valid_counts_mask] /= counts[valid_counts_mask].unsqueeze(-1)
 
     num_found = int(valid_counts_mask.sum())
-    print(f"DEBUG: Characters ACTUALLY FOUND in corpus and embeddings: {sorted(list(found_chars_set))}")
     if num_found < voc_size:
         missing_chars = [v for v_idx, v in enumerate(vocab) if not valid_counts_mask[v_idx].item()]
-        warnings.warn(f"Centroids generated. Found {num_found}/{voc_size} characters in corpus. Missing: {missing_chars}")
+        warnings.warn(f"Centroids generated. Found {num_found}/{voc_size} characters in corpus. "
+                      f"Characters without corpus instances have zero vectors: {missing_chars}")
+        # Consider alternative strategies for missing chars if needed
 
     print("Centroid generation complete.")
     return centroids

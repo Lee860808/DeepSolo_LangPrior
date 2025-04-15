@@ -1,15 +1,21 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
+import warnings
+import json
+import os
+from tqdm import tqdm
+from transformers import CanineTokenizer, CanineModel
+from detectron2.data import MetadataCatalog
 import copy
 from adet.utils.misc import accuracy, is_dist_avail_and_initialized
 from detectron2.utils.comm import get_world_size
 from adet.utils.curve_utils import BezierSampler
-from .matcher import build_matcher as build_matcher_orig # Keep original for bezier
-from .matcher_langprior import build_matcher as build_matcher_langprior # Your modified matcher file/func name
-from .linguistic_prior_utils import load_char_embeddings, generate_centroids, get_corpus
-from .linguistic_prior_utils import get_char_embeddings_canine, generate_centroids, get_corpus # Import specific functions
+from .matcher import build_matcher # Keep original for bezier
+from .linguistic_prior_utils import get_char_embeddings_canine, generate_centroids, get_corpus, _canine_model_cache # Import specific functions
 import pickle # For loading custom dict
+
 
 def sigmoid_focal_loss(inputs, targets, num_inst, alpha: float = 0.25, gamma: float = 2):
     """
@@ -116,32 +122,72 @@ class SetCriterion(nn.Module):
             else:
                 raise ValueError("Vocabulary size not supported or CUSTOM_DICT not provided.")
 
-            assert len(self.vocab) == self.voc_size, f"Loaded vocab size {len(self.vocab)} != config voc_size {self.voc_size}"
+                  
+            assert len(self.vocab) == self.char_voc_size, f"Loaded vocab size {len(self.vocab)} != expected char_voc_size {self.char_voc_size}"
+            # assert len(self.vocab) == self.voc_size, f"Loaded vocab size {len(self.vocab)} != config voc_size {self.voc_size}"
 
             # TODO: Define embedding dimension based on your chosen model (e.g., CANINE base is often 768)
             canine_model_name = "google/canine-c"
             embed_dim = 768 # Placeholder dimension
-            embeddings_dict, _ = load_char_embeddings(self.vocab, embed_dim) # Load embeddings
-            char_embeddings_dict = get_char_embeddings_canine(self.vocab, model_name=canine_model_name, device=device)
-            
+            #embeddings_dict, _ = load_char_embeddings(self.vocab, embed_dim) # Load embeddings
+            #char_embeddings_dict = get_char_embeddings_canine(self.vocab, model_name=canine_model_name, device=device)
+            print(f"  Calling get_char_embeddings_canine...")
+            char_embeddings_dict = get_char_embeddings_canine(cfg, self.vocab, device=device)
+            if char_embeddings_dict is None:
+                raise ValueError("get_char_embeddings_canine returned None!")
+            print(f"  Got char_embeddings_dict, type: {type(char_embeddings_dict)}")
+
             # Load corpus
             # TODO: You might want to define the corpus source in config
             generic_dict_path = "datasets/generic_90k_words.txt"
-            corpus = get_corpus(cfg.DATASETS.TRAIN, generic_dict_path)
+            corpus = get_corpus(cfg, cfg.DATASETS.TRAIN)
 
             # Generate centroids - needs to run only once, ideally load precomputed
             # We do it here for simplicity, but moving outside Trainer init is better
             device = torch.device(cfg.MODEL.DEVICE)
-            self.centroids = generate_centroids(embeddings_dict, corpus, self.vocab, device)
+            print(f"  Calling generate_centroids...")
+            self.centroids = generate_centroids(char_embeddings_dict, corpus, self.vocab, device)
             global _canine_model_cache
             if canine_model_name in _canine_model_cache:
                  del _canine_model_cache[canine_model_name] # Remove model from cache
                  torch.cuda.empty_cache() # Try to clear GPU memory
-            self.enc_matcher, self.dec_matcher = build_matcher_langprior(
+            self.enc_matcher, self.dec_matcher = build_matcher(
             cfg,
             centroids=self.centroids,
             vocab=self.vocab
         )
+    
+    # Pass cfg to get temperature
+    def generate_soft_distribution(cfg, char_centroid, all_centroids):
+        temperature = cfg.MODEL.LINGUISTIC_PRIOR.TEMPERATURE # Read from cfg
+        if char_centroid is None or torch.isnan(char_centroid).any() or (char_centroid == 0).all():
+            warnings.warn("Character centroid invalid, zero, or missing, returning uniform distribution.")
+            voc_size = all_centroids.shape[0]
+            return torch.ones(voc_size, device=all_centroids.device) / voc_size
+        similarities = F.cosine_similarity(char_centroid, all_centroids, dim=-1)
+        distribution = F.softmax(similarities / temperature, dim=-1)
+        return distribution
+
+    def apply_distribution_threshold(cfg, distribution, target_idx, voc_size=-1):
+        threshold = cfg.MODEL.LINGUISTIC_PRIOR.SOFT_TARGET_THRESHOLD # Read from cfg
+    # ... (Rest of the logic from previous step) ...
+        if voc_size == -1:
+            voc_size = distribution.shape[0]
+        if voc_size <= 1: # Handle edge case
+            return distribution
+        k = voc_size # Size of character vocabulary
+
+        if distribution[target_idx] >= threshold:
+            new_dist = torch.zeros_like(distribution)
+            p1_val = (1.0 - threshold) / (k - 1)
+            new_dist.fill_(p1_val)
+            new_dist[target_idx] = threshold
+            sum_val = new_dist.sum()
+            if abs(sum_val - 1.0) > 1e-6: # Add tolerance for floating point
+                new_dist /= sum_val
+            return new_dist
+        else:
+            return torch.ones_like(distribution) / k
 
     def get_char_voc_size(self):
         return self.voc_size - 1

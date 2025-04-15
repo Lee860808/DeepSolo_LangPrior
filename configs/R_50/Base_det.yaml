@@ -32,6 +32,13 @@ MODEL:
       POINT_COORD_WEIGHT: 1.0
       POINT_TEXT_WEIGHT: 0.5
       BOUNDARY_WEIGHT: 0.5
+  LINGUISTIC_PRIOR:
+      EMBED_MODEL_NAME: "google/canine-c" 
+      GENERIC_DICT_PATH: "datasets/generic_90k_words.txt"
+      SOFT_TARGET_THRESHOLD: 0.85
+      TEMPERATURE: 1.0
+           
+      
 
 SOLVER:
   WEIGHT_DECAY: 1e-4

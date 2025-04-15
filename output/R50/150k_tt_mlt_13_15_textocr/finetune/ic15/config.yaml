@@ -108,6 +108,11 @@ MODEL:
     NORM: ''
     OUT_CHANNELS: 256
   KEYPOINT_ON: false
+  LINGUISTIC_PRIOR:
+    EMBED_MODEL_NAME: google/canine-c
+    GENERIC_DICT_PATH: datasets/generic_90k_words.txt
+    SOFT_TARGET_THRESHOLD: 0.85
+    TEMPERATURE: 1.0
   LOAD_PROPOSALS: false
   MASK_ON: false
   META_ARCHITECTURE: TransformerPureDetector
@@ -326,7 +331,7 @@ MODEL:
       FOCAL_GAMMA: 2.0
       POINT_CLASS_WEIGHT: 1.0
       POINT_COORD_WEIGHT: 1.0
-      POINT_TEXT_WEIGHT: 0.5
+      POINT_TEXT_WEIGHT: 1.0
     NHEADS: 8
     NUM_FEATURE_LEVELS: 4
     NUM_POINTS: 25
@@ -337,13 +342,13 @@ MODEL:
   ViTAEv2:
     DROP_PATH_RATE: 0.2
     TYPE: vitaev2_s
-  WEIGHTS: weights/res50_pretrain_synth-tt-mlt-13-15-textocr.pth
+  WEIGHTS: output/R50/150k_tt_mlt_13_15_textocr/pretrain/model_final.pth
 OUTPUT_DIR: output/R50/150k_tt_mlt_13_15_textocr/finetune/ic15
 SEED: 42
 SOLVER:
   AMP:
     ENABLED: false
-  BASE_LR: 1.0e-05
+  BASE_LR: 6.25e-07
   BIAS_LR_FACTOR: 1.0
   CHECKPOINT_PERIOD: 1000
   CLIP_GRADIENTS:
@@ -352,8 +357,8 @@ SOLVER:
     ENABLED: true
     NORM_TYPE: 2.0
   GAMMA: 0.1
-  IMS_PER_BATCH: 8
-  LR_BACKBONE: 1.0e-06
+  IMS_PER_BATCH: 2
+  LR_BACKBONE: 6.25e-08
   LR_BACKBONE_NAMES:
   - backbone.0
   LR_LINEAR_PROJ_MULT: 1.0
