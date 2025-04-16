@@ -1,1 +1,0 @@
-python demo/demo.py --config-file configs/R_50/IC15/finetune_150k_tt_mlt_13_15_textocr.yaml --input demo/trial_img --output demo/trial_img_output --opts MODEL.WEIGHTS weights/res50_pretrain_synth-tt-mlt-13-15-textocr.pth
